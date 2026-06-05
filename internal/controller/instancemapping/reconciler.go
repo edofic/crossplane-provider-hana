@@ -24,6 +24,7 @@ import (
 	"github.com/SAP/crossplane-provider-hana/apis/inventory/v1alpha1"
 	"github.com/SAP/crossplane-provider-hana/internal/clients/hanacloud"
 	imclient "github.com/SAP/crossplane-provider-hana/internal/clients/hanacloud/instancemapping"
+	"github.com/SAP/crossplane-provider-hana/internal/controller/features"
 )
 
 const (
@@ -55,11 +56,14 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	name := managed.ControllerName(v1alpha1.InstanceMappingGroupKind)
 
 	log := o.Logger.WithValues("controller", name)
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.InstanceMappingGroupVersionKind),
+	opts := append([]managed.ReconcilerOption{
 		managed.WithExternalConnecter(NewConnector(mgr.GetClient(), log, nil)),
 		managed.WithLogger(log),
-		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))))
+		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
+	}, features.ManagementPoliciesOpts(o)...)
+	r := managed.NewReconciler(mgr,
+		resource.ManagedKind(v1alpha1.InstanceMappingGroupVersionKind),
+		opts...)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).

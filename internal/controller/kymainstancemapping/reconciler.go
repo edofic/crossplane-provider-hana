@@ -74,8 +74,7 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 	}
 
 	log := o.Logger.WithValues("controller", name)
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.KymaInstanceMappingGroupVersionKind),
+	opts := append([]managed.ReconcilerOption{
 		managed.WithExternalConnecter(NewConnector(
 			mgr.GetClient(),
 			resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
@@ -83,7 +82,11 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		)),
 		managed.WithLogger(log),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
-		managed.WithConnectionPublishers(cps...))
+		managed.WithConnectionPublishers(cps...),
+	}, features.ManagementPoliciesOpts(o)...)
+	r := managed.NewReconciler(mgr,
+		resource.ManagedKind(v1alpha1.KymaInstanceMappingGroupVersionKind),
+		opts...)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).

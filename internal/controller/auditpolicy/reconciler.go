@@ -61,8 +61,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, db xsql.DB) error {
 	}
 
 	log := o.Logger.WithValues("controller", name)
-	r := managed.NewReconciler(mgr,
-		resource.ManagedKind(v1alpha1.AuditPolicyGroupVersionKind),
+	opts := append([]managed.ReconcilerOption{
 		managed.WithExternalConnecter(&connector{
 			kube:      mgr.GetClient(),
 			usage:     resource.NewProviderConfigUsageTracker(mgr.GetClient(), &apisv1alpha1.ProviderConfigUsage{}),
@@ -72,7 +71,11 @@ func Setup(mgr ctrl.Manager, o controller.Options, db xsql.DB) error {
 		}),
 		managed.WithLogger(o.Logger.WithValues("controller", name)),
 		managed.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name))),
-		managed.WithConnectionPublishers(cps...))
+		managed.WithConnectionPublishers(cps...),
+	}, features.ManagementPoliciesOpts(o)...)
+	r := managed.NewReconciler(mgr,
+		resource.ManagedKind(v1alpha1.AuditPolicyGroupVersionKind),
+		opts...)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
