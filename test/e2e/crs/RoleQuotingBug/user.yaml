@@ -1,0 +1,28 @@
+apiVersion: admin.hana.sap.crossplane.io/v1alpha1
+kind: User
+metadata:
+  name: e2e-role-quoting-bug
+spec:
+  deletionPolicy: Delete
+  # lax so observed extra roles (PUBLIC, internal grants) aren't fought against.
+  # The bug we're reproducing manifests on the *desired* side regardless.
+  privilegeManagementPolicy: lax
+  forProvider:
+    authentication:
+      password:
+        passwordSecretRef:
+          key: password
+          name: e2e-role-quoting-bug-secret
+          namespace: default
+    username: E2EROLEQUOTINGBUG
+    # Non-restricted user, so handleDefaults appends raw "PUBLIC" to desired.Roles
+    # at every Update tick. After Observe runs once, status.atProvider.Roles holds
+    # the quoted form (\"PUBLIC\"). The Update path's buildDesiredParameters never
+    # normalizes, producing GRANT PUBLIC TO ... and SQL Error 258.
+    restrictedUser: false
+    # MONITORING is a built-in role that DBADMIN can grant on HANA Cloud, so we
+    # exercise the asymmetric quoting on more than just PUBLIC.
+    roles:
+      - MONITORING
+  providerConfigRef:
+    name: example
