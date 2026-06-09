@@ -59,6 +59,8 @@ type mockUserClient struct {
 	MockCreate                 func(ctx context.Context, parameters *v1alpha1.UserParameters, password string, providers []user.ResolvedUserMapping) error
 	MockDelete                 func(ctx context.Context, parameters *v1alpha1.UserParameters) error
 	MockFormatPrivilegeStrings func(privilegeStrings []string) ([]string, error)
+	MockUpdateRoles            func(ctx context.Context, grantee string, toGrant, toRevoke []string) error
+	MockUpdatePrivileges       func(ctx context.Context, grantee string, toGrant, toRevoke []string) error
 }
 
 // Implement the methods that user.Client struct has
@@ -84,6 +86,9 @@ func (m mockUserClient) Delete(ctx context.Context, parameters *v1alpha1.UserPar
 }
 
 func (m mockUserClient) UpdatePrivileges(ctx context.Context, grantee string, toGrant, toRevoke []string) error {
+	if m.MockUpdatePrivileges != nil {
+		return m.MockUpdatePrivileges(ctx, grantee, toGrant, toRevoke)
+	}
 	return nil
 }
 
@@ -100,6 +105,9 @@ func (m mockUserClient) UpdatePassword(ctx context.Context, username, password s
 }
 
 func (m mockUserClient) UpdateRoles(ctx context.Context, grantee string, toGrant, toRevoke []string) error {
+	if m.MockUpdateRoles != nil {
+		return m.MockUpdateRoles(ctx, grantee, toGrant, toRevoke)
+	}
 	return nil
 }
 
@@ -969,3 +977,177 @@ func TestGenerateReconcileRequestsFromSecret(t *testing.T) {
 		})
 	}
 }
+
+// TestUpdate_RoleQuotingDriftIsNoOp pins the fix for the role-quoting drift
+// introduced by PR #97 (commits cf0e5aa + 10e0dd5).
+//
+// The bug:
+//   - Observe() normalizes spec roles to canonical *quoted* form via
+//     FormatRoleStrings before persisting them into status.atProvider.Roles.
+//   - handleDefaults appends raw "PUBLIC" (unquoted) to non-restricted users.
+//   - Pre-fix, buildDesiredParameters did NOT normalize, so Update()'s diff
+//     compared unquoted desired against quoted observed and produced spurious
+//     GRANT/REVOKE pairs. Notably it tried GRANT PUBLIC, which HANA rejects
+//     with SQL Error 258 (only the internal SYSTEM user may grant PUBLIC),
+//     aborting Update before reaching updatePassword.
+//
+// This test sets up exactly that asymmetric state in-process (no DB, no kube
+// client, no kind cluster) and asserts that updateRoles is a no-op. With the
+// pre-fix reconciler, MockUpdateRoles would be called with the full role list
+// in toGrant; with the fix, it isn't called at all (or with empty slices).
+func TestUpdate_RoleQuotingDriftIsNoOp(t *testing.T) {
+	type capture struct {
+		called  bool
+		grantee string
+		toGrant []string
+		toRevoke []string
+	}
+	cases := map[string]struct {
+		reason            string
+		specRoles         []string  // unquoted, as a user would write in YAML
+		statusRoles       []string  // quoted, as Observe() would have populated
+		restrictedUser    bool
+		wantUpdateRolesCalled bool
+	}{
+		"NonRestrictedUser_PUBLICDefaultedAndQuotedInStatus": {
+			reason: "handleDefaults adds raw PUBLIC; status holds quoted PUBLIC + quoted MONITORING; " +
+				"after normalization both sides match and updateRoles must be a no-op",
+			specRoles:      []string{"MONITORING"},
+			statusRoles:    []string{`"PUBLIC"`, `"MONITORING"`},
+			restrictedUser: false,
+		},
+		"RestrictedUser_NoPUBLICDefaulted": {
+			reason: "Restricted users don't get PUBLIC defaulted; spec MONITORING vs status quoted " +
+				"MONITORING normalizes to a no-op",
+			specRoles:      []string{"MONITORING"},
+			statusRoles:    []string{`"MONITORING"`},
+			restrictedUser: true,
+		},
+		"SpecAlreadyQuoted_StatusQuoted": {
+			reason: "Idempotent: a user who writes their spec in already-quoted form should still " +
+				"see no-op diffs",
+			specRoles:      []string{`"MONITORING"`},
+			statusRoles:    []string{`"PUBLIC"`, `"MONITORING"`},
+			restrictedUser: false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cap := &capture{}
+			pwdUpToDate := true
+			isPwdEnabled := true
+
+			cr := &v1alpha1.User{
+				Spec: v1alpha1.UserSpec{
+					ForProvider: v1alpha1.UserParameters{
+						Username:                       demoUser,
+						Usergroup:                      "DEFAULT",
+						RestrictedUser:                 tc.restrictedUser,
+						IsPasswordLifetimeCheckEnabled: true,
+						Roles:                          tc.specRoles,
+					},
+					PrivilegeManagementPolicy: "lax",
+				},
+				Status: v1alpha1.UserStatus{
+					AtProvider: v1alpha1.UserObservation{
+						Username:                       new(demoUser),
+						Usergroup:                      strPtr("DEFAULT"),
+						Roles:                          tc.statusRoles,
+						IsPasswordLifetimeCheckEnabled: boolPtr(true),
+						// Skip the password branch entirely so the test doesn't
+						// depend on a kube client or password Secret.
+						PasswordUpToDate:  &pwdUpToDate,
+						IsPasswordEnabled: &isPwdEnabled,
+					},
+				},
+			}
+
+			e := external{
+				client: mockUserClient{
+					MockUpdateRoles: func(ctx context.Context, grantee string, toGrant, toRevoke []string) error {
+						cap.called = true
+						cap.grantee = grantee
+						cap.toGrant = toGrant
+						cap.toRevoke = toRevoke
+						return nil
+					},
+				},
+				log: &MockLogger{},
+			}
+
+			_, err := e.Update(context.Background(), cr)
+			if err != nil {
+				t.Fatalf("%s: unexpected Update error: %v", tc.reason, err)
+			}
+			if cap.called {
+				t.Errorf("%s: UpdateRoles was called with toGrant=%v toRevoke=%v; expected no-op. "+
+					"This indicates the role-quoting drift bug from PR #97 has regressed "+
+					"(buildDesiredParameters is missing FormatRoleStrings normalization).",
+					tc.reason, cap.toGrant, cap.toRevoke)
+			}
+		})
+	}
+}
+
+// TestUpdate_PrivilegeQuotingDriftIsNoOp is the symmetric test for privileges.
+// FormatPrivilegeStrings is also called from Observe() but was missing from
+// pre-fix buildDesiredParameters. The latent bug is masked for typical inputs
+// because parsePrivilegeStrings(...).String() already produces canonical form
+// for both sides, but the symmetric normalization should be locked down anyway.
+func TestUpdate_PrivilegeQuotingDriftIsNoOp(t *testing.T) {
+	cap := struct {
+		called   bool
+		toGrant  []string
+		toRevoke []string
+	}{}
+	pwdUpToDate := true
+	isPwdEnabled := true
+
+	cr := &v1alpha1.User{
+		Spec: v1alpha1.UserSpec{
+			ForProvider: v1alpha1.UserParameters{
+				Username:                       demoUser,
+				Usergroup:                      "DEFAULT",
+				IsPasswordLifetimeCheckEnabled: true,
+				Privileges:                     []string{"CATALOG READ"},
+			},
+			PrivilegeManagementPolicy: "lax",
+		},
+		Status: v1alpha1.UserStatus{
+			AtProvider: v1alpha1.UserObservation{
+				Username:                       new(demoUser),
+				Usergroup:                      strPtr("DEFAULT"),
+				Privileges:                     []string{"CATALOG READ"},
+				IsPasswordLifetimeCheckEnabled: boolPtr(true),
+				PasswordUpToDate:               &pwdUpToDate,
+				IsPasswordEnabled:              &isPwdEnabled,
+			},
+		},
+	}
+
+	e := external{
+		client: mockUserClient{
+			MockUpdatePrivileges: func(ctx context.Context, grantee string, toGrant, toRevoke []string) error {
+				cap.called = true
+				cap.toGrant = toGrant
+				cap.toRevoke = toRevoke
+				return nil
+			},
+		},
+		log: &MockLogger{},
+	}
+
+	_, err := e.Update(context.Background(), cr)
+	if err != nil {
+		t.Fatalf("unexpected Update error: %v", err)
+	}
+	if cap.called {
+		t.Errorf("UpdatePrivileges was called with toGrant=%v toRevoke=%v; expected no-op",
+			cap.toGrant, cap.toRevoke)
+	}
+}
+
+// strPtr / boolPtr are local helpers to keep the test fixtures terse.
+func strPtr(s string) *string { return &s }
+func boolPtr(b bool) *bool   { return &b }
